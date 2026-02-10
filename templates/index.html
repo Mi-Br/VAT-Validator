@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PVM Numerių Tikrinimas</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 32px;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+
+        .step {
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            border-left: 4px solid #667eea;
+        }
+
+        .step-title {
+            font-weight: 600;
+            color: #667eea;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+
+        .upload-area {
+            border: 2px dashed #667eea;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: white;
+        }
+
+        .upload-area:hover {
+            border-color: #764ba2;
+            background: #f8f9fa;
+        }
+
+        .upload-area.dragover {
+            border-color: #764ba2;
+            background: #e9ecef;
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            font-size: 14px;
+            margin-bottom: 10px;
+            transition: border-color 0.3s;
+        }
+
+        select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 14px 30px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            width: 100%;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .progress {
+            margin-top: 20px;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 30px;
+            background: #e9ecef;
+            border-radius: 15px;
+            overflow: hidden;
+            margin-bottom: 10px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            width: 0%;
+            transition: width 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 600;
+            font-size: 12px;
+        }
+
+        .results {
+            margin-top: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .result-item {
+            padding: 10px;
+            margin-bottom: 8px;
+            border-radius: 6px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 14px;
+        }
+
+        .result-item.valid {
+            background: #d4edda;
+            border-left: 4px solid #28a745;
+        }
+
+        .result-item.invalid {
+            background: #f8d7da;
+            border-left: 4px solid #dc3545;
+        }
+
+        .download-btn {
+            margin-top: 20px;
+            background: #28a745;
+        }
+
+        .download-btn:hover {
+            box-shadow: 0 5px 20px rgba(40, 167, 69, 0.4);
+        }
+
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 12px;
+            border-radius: 6px;
+            margin-top: 10px;
+            border-left: 4px solid #dc3545;
+        }
+
+        .icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+        }
+
+        .file-info {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+            border: 1px solid #e9ecef;
+        }
+
+        .file-info strong {
+            color: #667eea;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 PVM Numerių Tikrinimas</h1>
+        <p class="subtitle">Įkelkite Excel failą su PVM numeriais, kad patikrintumėte juos naudojant VIES sistemą</p>
+
+        <!-- Step 1: Upload File -->
+        <div id="step1" class="step">
+            <div class="step-title">1 Žingsnis: Įkelkite Excel Failą</div>
+            <div class="upload-area" id="uploadArea">
+                <div class="icon">📁</div>
+                <p><strong>Spauskite čia</strong> arba nutempkite failą</p>
+                <p style="font-size: 12px; color: #666; margin-top: 5px;">Excel failai (.xlsx, .xls) iki 16MB</p>
+                <input type="file" id="fileInput" accept=".xlsx,.xls">
+            </div>
+        </div>
+
+        <!-- Step 2: Select Sheet and Columns -->
+        <div id="step2" class="step hidden">
+            <div class="step-title">2 Žingsnis: Pasirinkite Lapą ir Stulpelius</div>
+
+            <label style="display: block; margin-bottom: 5px; font-weight: 500;">Lapas:</label>
+            <select id="sheetSelect">
+                <option value="">-- Pasirinkite Lapą --</option>
+            </select>
+
+            <label style="display: block; margin-bottom: 5px; margin-top: 15px; font-weight: 500;">PVM Numerių Stulpelis:</label>
+            <select id="vatColumnSelect">
+                <option value="">-- Pasirinkite PVM Stulpelį --</option>
+            </select>
+
+            <label style="display: block; margin-bottom: 5px; margin-top: 15px; font-weight: 500;">Šalies Kodo Stulpelis (neprivaloma):</label>
+            <select id="countryColumnSelect">
+                <option value="">-- Automatiškai aptikti iš PVM numerio --</option>
+            </select>
+            <p style="font-size: 12px; color: #666; margin-top: 5px;">
+                💡 PVM numeris turi prasidėti šalies kodu (pvz., LT100013590314)
+            </p>
+
+            <button id="validateBtn" style="margin-top: 20px;" disabled>Tikrinti PVM Numerius</button>
+        </div>
+
+        <!-- Step 3: Validation Progress -->
+        <div id="step3" class="step hidden">
+            <div class="step-title">3 Žingsnis: Tikrinimas Vykdomas</div>
+            <div class="progress">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill">0%</div>
+                </div>
+                <p id="progressText" style="text-align: center; color: #666; font-size: 14px;">Pradedamas tikrinimas...</p>
+            </div>
+        </div>
+
+        <!-- Step 4: Results -->
+        <div id="step4" class="step hidden">
+            <div class="step-title">4 Žingsnis: Rezultatai</div>
+            <div id="resultsSummary" style="margin-bottom: 15px;"></div>
+            <div class="results" id="resultsContainer"></div>
+            <button id="downloadBtn" class="download-btn">📥 Atsisiųsti Patikrintą Failą</button>
+        </div>
+    </div>
+
+    <script>
+        let uploadedFilename = '';
+        let selectedSheet = '';
+        let validationResults = [];
+        let outputFilename = '';
+
+        // File upload handling
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+
+        uploadArea.addEventListener('click', () => fileInput.click());
+
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            if (e.dataTransfer.files.length) {
+                fileInput.files = e.dataTransfer.files;
+                handleFileUpload(e.dataTransfer.files[0]);
+            }
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length) {
+                handleFileUpload(e.target.files[0]);
+            }
+        });
+
+        async function handleFileUpload(file) {
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
+
+                uploadedFilename = data.filename;
+
+                // Populate sheet select
+                const sheetSelect = document.getElementById('sheetSelect');
+                sheetSelect.innerHTML = data.sheets.map(sheet =>
+                    `<option value="${sheet}">${sheet}</option>`
+                ).join('');
+
+                // Populate column selects with first sheet's columns
+                populateColumns(data.columns);
+
+                // Show step 2
+                document.getElementById('step2').classList.remove('hidden');
+
+                // Update upload area
+                uploadArea.innerHTML = `
+                    <div class="icon">✅</div>
+                    <p><strong>${file.name}</strong></p>
+                    <p style="font-size: 12px; color: #666;">Failas sėkmingai įkeltas</p>
+                `;
+            } catch (error) {
+                alert('Klaida įkeliant failą: ' + error.message);
+            }
+        }
+
+        function populateColumns(columns) {
+            const vatSelect = document.getElementById('vatColumnSelect');
+            const countrySelect = document.getElementById('countryColumnSelect');
+
+            const columnOptions = columns.map(col =>
+                `<option value="${col}">${col}</option>`
+            ).join('');
+
+            vatSelect.innerHTML = '<option value="">-- Pasirinkite PVM Stulpelį --</option>' + columnOptions;
+            countrySelect.innerHTML = '<option value="">-- Automatiškai aptikti iš PVM numerio --</option>' + columnOptions;
+
+            // Auto-select if column contains "VAT" or "PVM"
+            const vatColumn = columns.find(col =>
+                col.toLowerCase().includes('vat') ||
+                col.toLowerCase().includes('pvm')
+            );
+            if (vatColumn) {
+                vatSelect.value = vatColumn;
+            }
+
+            // Auto-select if column contains "country" or "šalis"
+            const countryColumn = columns.find(col =>
+                col.toLowerCase().includes('country') ||
+                col.toLowerCase().includes('šalis')
+            );
+            if (countryColumn) {
+                countrySelect.value = countryColumn;
+            }
+
+            checkValidateButton();
+        }
+
+        // Sheet change handler
+        document.getElementById('sheetSelect').addEventListener('change', async (e) => {
+            selectedSheet = e.target.value;
+
+            if (!selectedSheet) return;
+
+            try {
+                const response = await fetch('/get-columns', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({filename: uploadedFilename, sheet: selectedSheet})
+                });
+
+                const data = await response.json();
+                populateColumns(data.columns);
+            } catch (error) {
+                alert('Klaida įkeliant stulpelius: ' + error.message);
+            }
+        });
+
+        // Enable validate button when VAT column is selected
+        document.getElementById('vatColumnSelect').addEventListener('change', checkValidateButton);
+
+        function checkValidateButton() {
+            const vatColumn = document.getElementById('vatColumnSelect').value;
+            document.getElementById('validateBtn').disabled = !vatColumn;
+        }
+
+        // Validate button handler
+        document.getElementById('validateBtn').addEventListener('click', async () => {
+            const sheet = document.getElementById('sheetSelect').value;
+            const vatColumn = document.getElementById('vatColumnSelect').value;
+            const countryColumn = document.getElementById('countryColumnSelect').value;
+
+            if (!sheet || !vatColumn) {
+                alert('Prašome pasirinkti lapą ir PVM stulpelį');
+                return;
+            }
+
+            // Show progress step
+            document.getElementById('step3').classList.remove('hidden');
+            document.getElementById('step2').classList.add('hidden');
+
+            try {
+                const response = await fetch('/validate', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        filename: uploadedFilename,
+                        sheet: sheet,
+                        vatColumn: vatColumn,
+                        countryColumn: countryColumn || null
+                    })
+                });
+
+                const data = await response.json();
+
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
+
+                validationResults = data.results;
+                outputFilename = data.output_file;
+
+                // Update progress
+                document.getElementById('progressFill').style.width = '100%';
+                document.getElementById('progressFill').textContent = '100%';
+                document.getElementById('progressText').textContent = 'Tikrinimas baigtas!';
+
+                // Show results
+                displayResults();
+
+            } catch (error) {
+                alert('Klaida tikrinant: ' + error.message);
+            }
+        });
+
+        function displayResults() {
+            const container = document.getElementById('resultsContainer');
+            const summary = document.getElementById('resultsSummary');
+
+            const validCount = validationResults.filter(r => r.valid).length;
+            const invalidCount = validationResults.length - validCount;
+
+            summary.innerHTML = `
+                <div style="background: white; padding: 15px; border-radius: 8px; border: 1px solid #e9ecef;">
+                    <strong>Iš viso:</strong> ${validationResults.length} PVM numerių |
+                    <strong style="color: #28a745;">Teisingi:</strong> ${validCount} |
+                    <strong style="color: #dc3545;">Neteisingi:</strong> ${invalidCount}
+                </div>
+            `;
+
+            container.innerHTML = validationResults.map(result => `
+                <div class="result-item ${result.valid ? 'valid' : 'invalid'}">
+                    <div>
+                        <strong>${result.country || ''} ${result.vat}</strong>
+                        ${result.name ? `<br><small>${result.name}</small>` : ''}
+                        ${result.error ? `<br><small style="color: #721c24;">${result.error}</small>` : ''}
+                    </div>
+                    <div style="font-weight: 600;">
+                        ${result.valid ? '✅ Teisingas' : '❌ Neteisingas'}
+                    </div>
+                </div>
+            `).join('');
+
+            document.getElementById('step3').classList.add('hidden');
+            document.getElementById('step4').classList.remove('hidden');
+        }
+
+        // Download button
+        document.getElementById('downloadBtn').addEventListener('click', () => {
+            window.location.href = `/download/${outputFilename}`;
+        });
+    </script>
+</body>
+</html>

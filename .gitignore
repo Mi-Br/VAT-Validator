@@ -1,0 +1,9 @@
+uploads/
+*.pyc
+__pycache__/
+venv/
+.env
+*.xlsx
+*.xls
+.DS_Store
+*.output
