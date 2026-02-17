@@ -24,21 +24,32 @@ def parse_vat_number(vat_input):
     Parse VAT number and extract country code and number.
     Returns (country_code, vat_number) tuple.
     """
+    # Valid EU country codes for VAT validation
+    VALID_EU_CODES = {
+        'AT', 'BE', 'BG', 'CY', 'CZ', 'DE', 'DK', 'EE', 'EL', 'ES',
+        'FI', 'FR', 'HR', 'HU', 'IE', 'IT', 'LT', 'LU', 'LV', 'MT',
+        'NL', 'PL', 'PT', 'RO', 'SE', 'SI', 'SK', 'XI'
+    }
+
     vat_str = str(vat_input).strip().replace(' ', '').replace('-', '').replace('.', '')
 
-    # Check if VAT starts with 2-letter country code
+    # Check if VAT starts with valid 2-letter EU country code
     if len(vat_str) >= 2 and vat_str[:2].isalpha():
         country_code = vat_str[:2].upper()
-        vat_number = vat_str[2:]
-        return country_code, vat_number
+        # Only extract if it's a valid EU country code
+        if country_code in VALID_EU_CODES:
+            vat_number = vat_str[2:]
+            return country_code, vat_number
 
-    # No country code in VAT number
+    # No valid country code in VAT number
     return None, vat_str
 
-def validate_vat(vat_input):
+def validate_vat(vat_input, retry_count=0, job_id=None, current_idx=0):
     """
     Validate VAT number using VIES API.
     Automatically extracts country code from VAT number.
+    Includes retry logic for rate limiting and timeouts.
+    Updates job status to show retry attempts in UI.
     """
     country_code, vat_number = parse_vat_number(vat_input)
 
@@ -50,13 +61,28 @@ def validate_vat(vat_input):
 
     try:
         url = f'https://ec.europa.eu/taxation_customs/vies/rest-api/ms/{country_code}/vat/{vat_number}'
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=30)
 
         # Check if response is valid JSON
         if not response.text or response.text.strip() == '':
             return {'valid': False, 'error': 'Empty response from VIES API', 'country': country_code}
 
         data = response.json()
+
+        # Handle MS_MAX_CONCURRENT_REQ error with retry
+        if data.get('userError') == 'MS_MAX_CONCURRENT_REQ':
+            # Retry more aggressively for rate limiting (up to 5 retries)
+            if retry_count < 5:
+                # Update UI to show retry status
+                if job_id and current_idx > 0:
+                    validation_jobs[job_id]['retrying'] = current_idx
+
+                # Exponential backoff: 2s, 4s, 6s, 8s, 10s
+                time.sleep(2 * (retry_count + 1))
+                return validate_vat(vat_input, retry_count + 1, job_id, current_idx)
+            else:
+                # After 5 retries, still mark as retriable (not invalid)
+                return {'valid': False, 'error': 'Pabandysiu vėliau (per daug užklausų)', 'country': country_code, 'retriable': True}
 
         return {
             'valid': data.get('isValid', False),
@@ -67,10 +93,35 @@ def validate_vat(vat_input):
         }
     except requests.exceptions.JSONDecodeError as e:
         return {'valid': False, 'error': f'Invalid API response: {str(e)}', 'country': country_code}
+    except requests.exceptions.SSLError as e:
+        # Retry on SSL errors (including SSL EOF errors)
+        # Must be before ConnectionError since SSLError inherits from it
+        if retry_count < 3:
+            if job_id and current_idx > 0:
+                validation_jobs[job_id]['retrying'] = current_idx
+            time.sleep(2 * (retry_count + 1))  # Longer delay for SSL issues
+            return validate_vat(vat_input, retry_count + 1, job_id, current_idx)
+        return {'valid': False, 'error': 'SSL connection error (VIES API SSL issue)', 'country': country_code}
     except requests.exceptions.Timeout:
-        return {'valid': False, 'error': 'API timeout', 'country': country_code}
+        # Retry on timeout
+        if retry_count < 2:
+            if job_id and current_idx > 0:
+                validation_jobs[job_id]['retrying'] = current_idx
+            time.sleep(1 * (retry_count + 1))
+            return validate_vat(vat_input, retry_count + 1, job_id, current_idx)
+        return {'valid': False, 'error': 'API timeout (server not responding)', 'country': country_code}
+    except requests.exceptions.ConnectionError as e:
+        # Retry on connection reset/refused errors (catches ConnectionResetError wrapped by requests)
+        if retry_count < 3:
+            if job_id and current_idx > 0:
+                validation_jobs[job_id]['retrying'] = current_idx
+            time.sleep(2 * (retry_count + 1))  # Longer delay for connection issues
+            return validate_vat(vat_input, retry_count + 1, job_id, current_idx)
+        return {'valid': False, 'error': 'Connection error (VIES API connection lost)', 'country': country_code}
     except Exception as e:
-        return {'valid': False, 'error': str(e), 'country': country_code}
+        # Log unexpected errors with full details
+        error_msg = f'Unexpected error: {type(e).__name__}: {str(e)}'
+        return {'valid': False, 'error': error_msg, 'country': country_code}
 
 @app.route('/')
 def index():
@@ -167,22 +218,40 @@ def process_validation_job(job_id, filename, sheet_name, vat_column):
         red_fill = PatternFill(start_color="FFB6C1", end_color="FFB6C1", fill_type="solid")
         yellow_fill = PatternFill(start_color="FFFFE0", end_color="FFFFE0", fill_type="solid")
 
-        # Count total VAT numbers to process
+        # Count total VAT numbers to process FIRST
         vat_rows = []
         for row_idx in range(2, sheet.max_row + 1):
             vat_value = sheet.cell(row_idx, vat_col_idx).value
-            if vat_value:
+            if vat_value and str(vat_value).strip():
                 vat_rows.append((row_idx, vat_value))
 
         total = len(vat_rows)
-        validation_jobs[job_id]['total'] = total
 
-        # Process each VAT number
+        # Update total immediately so frontend can display it
+        validation_jobs[job_id]['total'] = total
+        validation_jobs[job_id]['status'] = 'processing'
+
+        if total == 0:
+            validation_jobs[job_id]['status'] = 'error'
+            validation_jobs[job_id]['error'] = 'No VAT numbers found in selected column'
+            return
+
+        # Process each VAT number sequentially
         for idx, (row_idx, vat_value) in enumerate(vat_rows, 1):
             vat_cell = sheet.cell(row_idx, vat_col_idx)
 
-            # Validate VAT
-            result = validate_vat(vat_value)
+            # Update progress before validation
+            validation_jobs[job_id]['processed'] = idx
+            validation_jobs[job_id]['progress'] = int((idx / total) * 100)
+
+            # Clear retry flag before validation
+            validation_jobs[job_id]['retrying'] = None
+
+            # Validate VAT with retry logic (pass job_id and idx for retry tracking)
+            result = validate_vat(vat_value, job_id=job_id, current_idx=idx)
+
+            # Clear retry flag after validation completes
+            validation_jobs[job_id]['retrying'] = None
 
             # Color code the cell
             if result['valid']:
@@ -192,22 +261,23 @@ def process_validation_job(job_id, filename, sheet_name, vat_column):
             else:
                 vat_cell.fill = yellow_fill
 
+            # Parse the VAT to get clean country code and number
+            parsed_country, parsed_number = parse_vat_number(vat_value)
+
             # Add to results
             validation_jobs[job_id]['results'].append({
                 'row': row_idx,
-                'vat': str(vat_value),
+                'vat': parsed_number if parsed_country else str(vat_value),
                 'country': result.get('country', ''),
                 'valid': result['valid'],
                 'name': result.get('name', ''),
                 'error': result.get('error')
             })
 
-            # Update progress
-            validation_jobs[job_id]['processed'] = idx
-            validation_jobs[job_id]['progress'] = int((idx / total) * 100)
-
-            # Small delay to be nice to the API
-            time.sleep(0.3)
+            # Delay between requests to avoid rate limiting
+            # Based on research: VIES has undocumented concurrent limits
+            # 1 second delay balances speed vs. reliability
+            time.sleep(1.0)
 
         # Save the modified file
         output_filename = f'validated_{filename}'
@@ -218,6 +288,7 @@ def process_validation_job(job_id, filename, sheet_name, vat_column):
         # Mark as complete
         validation_jobs[job_id]['status'] = 'completed'
         validation_jobs[job_id]['output_file'] = output_filename
+        validation_jobs[job_id]['progress'] = 100
 
     except Exception as e:
         validation_jobs[job_id]['status'] = 'error'
@@ -236,11 +307,12 @@ def validate():
 
     # Initialize job
     validation_jobs[job_id] = {
-        'status': 'processing',
+        'status': 'initializing',
         'progress': 0,
         'processed': 0,
         'total': 0,
         'results': [],
+        'retrying': None,  # Track which VAT is being retried
         'output_file': None,
         'error': None
     }
@@ -253,6 +325,9 @@ def validate():
     thread.daemon = True
     thread.start()
 
+    # Small delay to ensure thread has started
+    time.sleep(0.1)
+
     return jsonify({
         'success': True,
         'job_id': job_id
@@ -262,15 +337,36 @@ def validate():
 def validate_progress(job_id):
     """Server-Sent Events endpoint for validation progress"""
     def generate():
+        # Wait a bit for job to be created if not found immediately
+        max_wait = 5
+        waited = 0
+        while job_id not in validation_jobs and waited < max_wait:
+            time.sleep(0.2)
+            waited += 0.2
+
         if job_id not in validation_jobs:
-            yield f"data: {json.dumps({'error': 'Job not found'})}\n\n"
+            yield f"data: {json.dumps({'status': 'error', 'error': 'Job not found. Please try again.'})}\n\n"
             return
+
+        last_sent_count = 0
 
         while True:
             job = validation_jobs[job_id]
 
-            # Send progress update
-            yield f"data: {json.dumps(job)}\n\n"
+            # Send progress update with all results
+            update = {
+                'status': job['status'],
+                'progress': job['progress'],
+                'processed': job['processed'],
+                'total': job['total'],
+                'results': job['results'],
+                'retrying': job.get('retrying'),  # Send retry status
+                'output_file': job.get('output_file'),
+                'error': job.get('error')
+            }
+            yield f"data: {json.dumps(update)}\n\n"
+
+            last_sent_count = len(job['results'])
 
             # Stop if completed or errored
             if job['status'] in ['completed', 'error']:

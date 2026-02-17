@@ -271,7 +271,7 @@
 
         <!-- Ko-fi Support Link -->
         <div style="text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e9ecef;">
-            <p style="color: #666; font-size: 14px; margin-bottom: 10px;">Jei šis įrankis jums naudingas 😊</p>
+            <p style="color: #666; font-size: 14px; margin-bottom: 10px;">Turite daugiau užduočių automatizavimui? Padėsiu prie kavos! ☕</p>
             <a href='https://ko-fi.com/Y8Y016K89Z' target='_blank'>
                 <img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi6.png?v=6' border='0' alt='Nupirk man kavos ko-fi.com' />
             </a>
@@ -459,15 +459,33 @@
                     if (job.error) {
                         alert('Klaida: ' + job.error);
                         eventSource.close();
+                        document.getElementById('step2').classList.remove('hidden');
+                        document.getElementById('step3').classList.add('hidden');
                         return;
                     }
 
                     // Update progress bar
                     const progress = job.progress || 0;
+                    const processed = job.processed || 0;
+                    const total = job.total || 0;
+                    const remaining = total - processed;
+                    const retrying = job.retrying;  // Which VAT is being retried
+
                     document.getElementById('progressFill').style.width = progress + '%';
                     document.getElementById('progressFill').textContent = progress + '%';
-                    document.getElementById('progressText').textContent =
-                        `Tikrinama: ${job.processed} iš ${job.total} PVM numerių...`;
+
+                    // Show detailed progress with remaining count and retry status
+                    if (job.status === 'initializing') {
+                        document.getElementById('progressText').textContent = 'Pasiruošiama tikrinimui...';
+                    } else if (total > 0) {
+                        let progressMsg = `Tikrinama: ${processed} iš ${total} PVM numerių (liko: ${remaining})`;
+                        if (retrying) {
+                            progressMsg += ' 🔄 Kartojama užklausa...';
+                        }
+                        document.getElementById('progressText').textContent = progressMsg;
+                    } else {
+                        document.getElementById('progressText').textContent = 'Pradedamas tikrinimas...';
+                    }
 
                     // Show partial results as we go (show step 4 early)
                     if (job.results && job.results.length > 0 && validationResults.length === 0) {
@@ -477,7 +495,7 @@
                     // Update results in real-time
                     if (job.results && job.results.length > validationResults.length) {
                         validationResults = job.results;
-                        displayResults();
+                        displayResults(false);  // false = don't hide progress bar
                     }
 
                     // If completed, finalize
@@ -485,10 +503,13 @@
                         validationResults = job.results;
                         outputFilename = job.output_file;
 
-                        document.getElementById('progressText').textContent = 'Tikrinimas baigtas!';
+                        document.getElementById('progressFill').style.width = '100%';
+                        document.getElementById('progressFill').textContent = '100%';
+                        document.getElementById('progressText').textContent =
+                            `Tikrinimas baigtas! Patikrinta ${total} PVM numerių.`;
                         eventSource.close();
 
-                        displayResults();
+                        displayResults(true);  // true = hide progress bar now that we're done
                     }
                 };
 
@@ -508,7 +529,7 @@
             }
         });
 
-        function displayResults() {
+        function displayResults(hideProgress = false) {
             const container = document.getElementById('resultsContainer');
             const summary = document.getElementById('resultsSummary');
 
@@ -547,7 +568,10 @@
                 container.scrollTop = scrollPos;
             }
 
-            document.getElementById('step3').classList.add('hidden');
+            // Only hide progress bar when validation is complete
+            if (hideProgress) {
+                document.getElementById('step3').classList.add('hidden');
+            }
             document.getElementById('step4').classList.remove('hidden');
         }
 
