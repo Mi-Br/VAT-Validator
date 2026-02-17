@@ -1,9 +1,12 @@
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify, send_file, Response, stream_with_context
 import openpyxl
 from openpyxl.styles import PatternFill
 import requests
 import time
 import os
+import json
+import uuid
+import threading
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -12,6 +15,9 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
 # Create uploads folder if it doesn't exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# In-memory storage for validation jobs
+validation_jobs = {}
 
 def parse_vat_number(vat_input):
     """
@@ -45,6 +51,11 @@ def validate_vat(vat_input):
     try:
         url = f'https://ec.europa.eu/taxation_customs/vies/rest-api/ms/{country_code}/vat/{vat_number}'
         response = requests.get(url, timeout=10)
+
+        # Check if response is valid JSON
+        if not response.text or response.text.strip() == '':
+            return {'valid': False, 'error': 'Empty response from VIES API', 'country': country_code}
+
         data = response.json()
 
         return {
@@ -54,6 +65,10 @@ def validate_vat(vat_input):
             'country': country_code,
             'error': None if data.get('userError') == 'VALID' else data.get('userError')
         }
+    except requests.exceptions.JSONDecodeError as e:
+        return {'valid': False, 'error': f'Invalid API response: {str(e)}', 'country': country_code}
+    except requests.exceptions.Timeout:
+        return {'valid': False, 'error': 'API timeout', 'country': country_code}
     except Exception as e:
         return {'valid': False, 'error': str(e), 'country': country_code}
 
@@ -127,51 +142,46 @@ def get_columns():
     except Exception as e:
         return jsonify({'error': f'Error reading sheet: {str(e)}'}), 400
 
-@app.route('/validate', methods=['POST'])
-def validate():
-    """Validate VAT numbers in the specified column"""
-    data = request.json
-    filename = secure_filename(data.get('filename'))
-    sheet_name = data.get('sheet')
-    vat_column = data.get('vatColumn')
-    country_column = data.get('countryColumn')
-
+def process_validation_job(job_id, filename, sheet_name, vat_column):
+    """Background worker to process VAT validation"""
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
 
     try:
         wb = openpyxl.load_workbook(filepath)
         sheet = wb[sheet_name]
 
-        # Find column indices
+        # Find column index
         vat_col_idx = None
-        country_col_idx = None
-
         for idx, cell in enumerate(sheet[1], 1):
             if cell.value == vat_column:
                 vat_col_idx = idx
-            if cell.value == country_column:
-                country_col_idx = idx
+                break
 
         if vat_col_idx is None:
-            return jsonify({'error': f'Column "{vat_column}" not found'}), 400
+            validation_jobs[job_id]['status'] = 'error'
+            validation_jobs[job_id]['error'] = f'Column "{vat_column}" not found'
+            return
 
         # Define colors
         green_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
         red_fill = PatternFill(start_color="FFB6C1", end_color="FFB6C1", fill_type="solid")
         yellow_fill = PatternFill(start_color="FFFFE0", end_color="FFFFE0", fill_type="solid")
 
-        results = []
-
-        # Process each row (skip header)
+        # Count total VAT numbers to process
+        vat_rows = []
         for row_idx in range(2, sheet.max_row + 1):
+            vat_value = sheet.cell(row_idx, vat_col_idx).value
+            if vat_value:
+                vat_rows.append((row_idx, vat_value))
+
+        total = len(vat_rows)
+        validation_jobs[job_id]['total'] = total
+
+        # Process each VAT number
+        for idx, (row_idx, vat_value) in enumerate(vat_rows, 1):
             vat_cell = sheet.cell(row_idx, vat_col_idx)
-            vat_value = vat_cell.value
 
-            # Skip empty cells
-            if not vat_value:
-                continue
-
-            # Validate VAT (country code is extracted from VAT number itself)
+            # Validate VAT
             result = validate_vat(vat_value)
 
             # Color code the cell
@@ -180,10 +190,10 @@ def validate():
             elif result.get('country'):
                 vat_cell.fill = red_fill
             else:
-                # No country code found - yellow
                 vat_cell.fill = yellow_fill
 
-            results.append({
+            # Add to results
+            validation_jobs[job_id]['results'].append({
                 'row': row_idx,
                 'vat': str(vat_value),
                 'country': result.get('country', ''),
@@ -191,6 +201,10 @@ def validate():
                 'name': result.get('name', ''),
                 'error': result.get('error')
             })
+
+            # Update progress
+            validation_jobs[job_id]['processed'] = idx
+            validation_jobs[job_id]['progress'] = int((idx / total) * 100)
 
             # Small delay to be nice to the API
             time.sleep(0.3)
@@ -201,14 +215,77 @@ def validate():
         wb.save(output_path)
         wb.close()
 
-        return jsonify({
-            'success': True,
-            'results': results,
-            'output_file': output_filename
-        })
+        # Mark as complete
+        validation_jobs[job_id]['status'] = 'completed'
+        validation_jobs[job_id]['output_file'] = output_filename
 
     except Exception as e:
-        return jsonify({'error': f'Error processing file: {str(e)}'}), 500
+        validation_jobs[job_id]['status'] = 'error'
+        validation_jobs[job_id]['error'] = str(e)
+
+@app.route('/validate', methods=['POST'])
+def validate():
+    """Start VAT validation in background and return job ID"""
+    data = request.json
+    filename = secure_filename(data.get('filename'))
+    sheet_name = data.get('sheet')
+    vat_column = data.get('vatColumn')
+
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+
+    # Initialize job
+    validation_jobs[job_id] = {
+        'status': 'processing',
+        'progress': 0,
+        'processed': 0,
+        'total': 0,
+        'results': [],
+        'output_file': None,
+        'error': None
+    }
+
+    # Start background thread
+    thread = threading.Thread(
+        target=process_validation_job,
+        args=(job_id, filename, sheet_name, vat_column)
+    )
+    thread.daemon = True
+    thread.start()
+
+    return jsonify({
+        'success': True,
+        'job_id': job_id
+    })
+
+@app.route('/validate-progress/<job_id>')
+def validate_progress(job_id):
+    """Server-Sent Events endpoint for validation progress"""
+    def generate():
+        if job_id not in validation_jobs:
+            yield f"data: {json.dumps({'error': 'Job not found'})}\n\n"
+            return
+
+        while True:
+            job = validation_jobs[job_id]
+
+            # Send progress update
+            yield f"data: {json.dumps(job)}\n\n"
+
+            # Stop if completed or errored
+            if job['status'] in ['completed', 'error']:
+                break
+
+            time.sleep(0.5)  # Update every 500ms
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no'
+        }
+    )
 
 @app.route('/download/<filename>')
 def download(filename):

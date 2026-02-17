@@ -420,7 +420,6 @@
         document.getElementById('validateBtn').addEventListener('click', async () => {
             const sheet = document.getElementById('sheetSelect').value;
             const vatColumn = document.getElementById('vatColumnSelect').value;
-            const countryColumn = document.getElementById('countryColumnSelect').value;
 
             if (!sheet || !vatColumn) {
                 alert('Prašome pasirinkti lapą ir PVM stulpelį');
@@ -432,14 +431,14 @@
             document.getElementById('step2').classList.add('hidden');
 
             try {
+                // Start validation job
                 const response = await fetch('/validate', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({
                         filename: uploadedFilename,
                         sheet: sheet,
-                        vatColumn: vatColumn,
-                        countryColumn: countryColumn || null
+                        vatColumn: vatColumn
                     })
                 });
 
@@ -450,16 +449,59 @@
                     return;
                 }
 
-                validationResults = data.results;
-                outputFilename = data.output_file;
+                // Connect to progress stream
+                const jobId = data.job_id;
+                const eventSource = new EventSource(`/validate-progress/${jobId}`);
 
-                // Update progress
-                document.getElementById('progressFill').style.width = '100%';
-                document.getElementById('progressFill').textContent = '100%';
-                document.getElementById('progressText').textContent = 'Tikrinimas baigtas!';
+                eventSource.onmessage = (event) => {
+                    const job = JSON.parse(event.data);
 
-                // Show results
-                displayResults();
+                    if (job.error) {
+                        alert('Klaida: ' + job.error);
+                        eventSource.close();
+                        return;
+                    }
+
+                    // Update progress bar
+                    const progress = job.progress || 0;
+                    document.getElementById('progressFill').style.width = progress + '%';
+                    document.getElementById('progressFill').textContent = progress + '%';
+                    document.getElementById('progressText').textContent =
+                        `Tikrinama: ${job.processed} iš ${job.total} PVM numerių...`;
+
+                    // Show partial results as we go (show step 4 early)
+                    if (job.results && job.results.length > 0 && validationResults.length === 0) {
+                        document.getElementById('step4').classList.remove('hidden');
+                    }
+
+                    // Update results in real-time
+                    if (job.results && job.results.length > validationResults.length) {
+                        validationResults = job.results;
+                        displayResults();
+                    }
+
+                    // If completed, finalize
+                    if (job.status === 'completed') {
+                        validationResults = job.results;
+                        outputFilename = job.output_file;
+
+                        document.getElementById('progressText').textContent = 'Tikrinimas baigtas!';
+                        eventSource.close();
+
+                        displayResults();
+                    }
+                };
+
+                eventSource.onerror = (error) => {
+                    console.error('EventSource error:', error);
+                    document.getElementById('progressText').textContent = 'Klaida gaunant progresą. Bandoma iš naujo...';
+
+                    // EventSource automatically reconnects, but close after 30 seconds
+                    setTimeout(() => {
+                        eventSource.close();
+                        alert('Nepavyko gauti progreso atnaujinimų. Prašome perkrauti puslapį ir bandyti dar kartą.');
+                    }, 30000);
+                };
 
             } catch (error) {
                 alert('Klaida tikrinant: ' + error.message);
@@ -481,6 +523,10 @@
                 </div>
             `;
 
+            // Keep scroll position
+            const scrollPos = container.scrollTop;
+            const wasAtBottom = (container.scrollHeight - container.scrollTop - container.clientHeight) < 100;
+
             container.innerHTML = validationResults.map(result => `
                 <div class="result-item ${result.valid ? 'valid' : 'invalid'}">
                     <div>
@@ -493,6 +539,13 @@
                     </div>
                 </div>
             `).join('');
+
+            // Auto-scroll to bottom if user was at bottom
+            if (wasAtBottom) {
+                container.scrollTop = container.scrollHeight;
+            } else {
+                container.scrollTop = scrollPos;
+            }
 
             document.getElementById('step3').classList.add('hidden');
             document.getElementById('step4').classList.remove('hidden');
