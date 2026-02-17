@@ -178,8 +178,22 @@
             background: #28a745;
         }
 
-        .download-btn:hover {
+        .download-btn:hover:not(:disabled) {
             box-shadow: 0 5px 20px rgba(40, 167, 69, 0.4);
+        }
+
+        .download-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+
+        .time-estimate {
+            text-align: center;
+            color: #667eea;
+            font-size: 14px;
+            font-weight: 600;
+            margin-top: 10px;
         }
 
         .error {
@@ -258,6 +272,7 @@
                     <div class="progress-fill" id="progressFill">0%</div>
                 </div>
                 <p id="progressText" style="text-align: center; color: #666; font-size: 14px;">Pradedamas tikrinimas...</p>
+                <p id="timeEstimate" class="time-estimate" style="display: none;">⏱️ Likęs laikas: <span id="timeRemaining">--:--</span></p>
             </div>
         </div>
 
@@ -266,7 +281,7 @@
             <div class="step-title">4 Žingsnis: Rezultatai</div>
             <div id="resultsSummary" style="margin-bottom: 15px;"></div>
             <div class="results" id="resultsContainer"></div>
-            <button id="downloadBtn" class="download-btn">📥 Atsisiųsti Patikrintą Failą</button>
+            <button id="downloadBtn" class="download-btn" disabled>📥 Atsisiųsti Patikrintą Failą</button>
         </div>
 
         <!-- Ko-fi Support Link -->
@@ -477,14 +492,30 @@
                     // Show detailed progress with remaining count and retry status
                     if (job.status === 'initializing') {
                         document.getElementById('progressText').textContent = 'Pasiruošiama tikrinimui...';
+                        document.getElementById('timeEstimate').style.display = 'none';
                     } else if (total > 0) {
                         let progressMsg = `Tikrinama: ${processed} iš ${total} PVM numerių (liko: ${remaining})`;
                         if (retrying) {
                             progressMsg += ' 🔄 Kartojama užklausa...';
                         }
                         document.getElementById('progressText').textContent = progressMsg;
+
+                        // Calculate and display estimated time remaining
+                        if (remaining > 0 && processed > 0) {
+                            // Average 1.5 seconds per VAT (1s delay + 0.5s processing)
+                            const estimatedSeconds = Math.ceil(remaining * 1.5);
+                            const minutes = Math.floor(estimatedSeconds / 60);
+                            const seconds = estimatedSeconds % 60;
+                            const timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+
+                            document.getElementById('timeRemaining').textContent = timeStr;
+                            document.getElementById('timeEstimate').style.display = 'block';
+                        } else {
+                            document.getElementById('timeEstimate').style.display = 'none';
+                        }
                     } else {
                         document.getElementById('progressText').textContent = 'Pradedamas tikrinimas...';
+                        document.getElementById('timeEstimate').style.display = 'none';
                     }
 
                     // Show partial results as we go (show step 4 early)
@@ -507,6 +538,11 @@
                         document.getElementById('progressFill').textContent = '100%';
                         document.getElementById('progressText').textContent =
                             `Tikrinimas baigtas! Patikrinta ${total} PVM numerių.`;
+                        document.getElementById('timeEstimate').style.display = 'none';
+
+                        // Enable download button
+                        document.getElementById('downloadBtn').disabled = false;
+
                         eventSource.close();
 
                         displayResults(true);  // true = hide progress bar now that we're done

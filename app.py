@@ -16,8 +16,17 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 # Create uploads folder if it doesn't exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# In-memory storage for validation jobs
+# In-memory storage for validation jobs with thread safety
 validation_jobs = {}
+validation_jobs_lock = threading.Lock()
+
+def update_job(job_id, **kwargs):
+    """Thread-safe helper to update job status"""
+    with validation_jobs_lock:
+        if job_id in validation_jobs:
+            validation_jobs[job_id].update(kwargs)
+        else:
+            print(f"[WARNING] Tried to update non-existent job {job_id}")
 
 def parse_vat_number(vat_input):
     """
@@ -75,7 +84,7 @@ def validate_vat(vat_input, retry_count=0, job_id=None, current_idx=0):
             if retry_count < 5:
                 # Update UI to show retry status
                 if job_id and current_idx > 0:
-                    validation_jobs[job_id]['retrying'] = current_idx
+                    update_job(job_id, retrying=current_idx)
 
                 # Exponential backoff: 2s, 4s, 6s, 8s, 10s
                 time.sleep(2 * (retry_count + 1))
@@ -98,7 +107,7 @@ def validate_vat(vat_input, retry_count=0, job_id=None, current_idx=0):
         # Must be before ConnectionError since SSLError inherits from it
         if retry_count < 3:
             if job_id and current_idx > 0:
-                validation_jobs[job_id]['retrying'] = current_idx
+                update_job(job_id, retrying=current_idx)
             time.sleep(2 * (retry_count + 1))  # Longer delay for SSL issues
             return validate_vat(vat_input, retry_count + 1, job_id, current_idx)
         return {'valid': False, 'error': 'SSL connection error (VIES API SSL issue)', 'country': country_code}
@@ -106,7 +115,7 @@ def validate_vat(vat_input, retry_count=0, job_id=None, current_idx=0):
         # Retry on timeout
         if retry_count < 2:
             if job_id and current_idx > 0:
-                validation_jobs[job_id]['retrying'] = current_idx
+                update_job(job_id, retrying=current_idx)
             time.sleep(1 * (retry_count + 1))
             return validate_vat(vat_input, retry_count + 1, job_id, current_idx)
         return {'valid': False, 'error': 'API timeout (server not responding)', 'country': country_code}
@@ -114,7 +123,7 @@ def validate_vat(vat_input, retry_count=0, job_id=None, current_idx=0):
         # Retry on connection reset/refused errors (catches ConnectionResetError wrapped by requests)
         if retry_count < 3:
             if job_id and current_idx > 0:
-                validation_jobs[job_id]['retrying'] = current_idx
+                update_job(job_id, retrying=current_idx)
             time.sleep(2 * (retry_count + 1))  # Longer delay for connection issues
             return validate_vat(vat_input, retry_count + 1, job_id, current_idx)
         return {'valid': False, 'error': 'Connection error (VIES API connection lost)', 'country': country_code}
@@ -195,6 +204,7 @@ def get_columns():
 
 def process_validation_job(job_id, filename, sheet_name, vat_column):
     """Background worker to process VAT validation"""
+    print(f"[WORKER] Starting job {job_id}")
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
 
     try:
@@ -209,8 +219,8 @@ def process_validation_job(job_id, filename, sheet_name, vat_column):
                 break
 
         if vat_col_idx is None:
-            validation_jobs[job_id]['status'] = 'error'
-            validation_jobs[job_id]['error'] = f'Column "{vat_column}" not found'
+            update_job(job_id, status='error', error=f'Column "{vat_column}" not found')
+            print(f"[WORKER] Job {job_id} error: column not found")
             return
 
         # Define colors
@@ -228,12 +238,11 @@ def process_validation_job(job_id, filename, sheet_name, vat_column):
         total = len(vat_rows)
 
         # Update total immediately so frontend can display it
-        validation_jobs[job_id]['total'] = total
-        validation_jobs[job_id]['status'] = 'processing'
+        update_job(job_id, total=total, status='processing')
+        print(f"[WORKER] Job {job_id} found {total} VAT numbers")
 
         if total == 0:
-            validation_jobs[job_id]['status'] = 'error'
-            validation_jobs[job_id]['error'] = 'No VAT numbers found in selected column'
+            update_job(job_id, status='error', error='No VAT numbers found in selected column')
             return
 
         # Process each VAT number sequentially
@@ -241,17 +250,17 @@ def process_validation_job(job_id, filename, sheet_name, vat_column):
             vat_cell = sheet.cell(row_idx, vat_col_idx)
 
             # Update progress before validation
-            validation_jobs[job_id]['processed'] = idx
-            validation_jobs[job_id]['progress'] = int((idx / total) * 100)
+            progress_pct = int((idx / total) * 100)
+            update_job(job_id, processed=idx, progress=progress_pct)
 
             # Clear retry flag before validation
-            validation_jobs[job_id]['retrying'] = None
+            update_job(job_id, retrying=None)
 
             # Validate VAT with retry logic (pass job_id and idx for retry tracking)
             result = validate_vat(vat_value, job_id=job_id, current_idx=idx)
 
             # Clear retry flag after validation completes
-            validation_jobs[job_id]['retrying'] = None
+            update_job(job_id, retrying=None)
 
             # Color code the cell
             if result['valid']:
@@ -264,15 +273,19 @@ def process_validation_job(job_id, filename, sheet_name, vat_column):
             # Parse the VAT to get clean country code and number
             parsed_country, parsed_number = parse_vat_number(vat_value)
 
-            # Add to results
-            validation_jobs[job_id]['results'].append({
+            # Add to results (need to append to list safely)
+            result_item = {
                 'row': row_idx,
                 'vat': parsed_number if parsed_country else str(vat_value),
                 'country': result.get('country', ''),
                 'valid': result['valid'],
                 'name': result.get('name', ''),
                 'error': result.get('error')
-            })
+            }
+
+            with validation_jobs_lock:
+                if job_id in validation_jobs:
+                    validation_jobs[job_id]['results'].append(result_item)
 
             # Delay between requests to avoid rate limiting
             # Based on research: VIES has undocumented concurrent limits
@@ -286,13 +299,12 @@ def process_validation_job(job_id, filename, sheet_name, vat_column):
         wb.close()
 
         # Mark as complete
-        validation_jobs[job_id]['status'] = 'completed'
-        validation_jobs[job_id]['output_file'] = output_filename
-        validation_jobs[job_id]['progress'] = 100
+        update_job(job_id, status='completed', output_file=output_filename, progress=100)
+        print(f"[WORKER] Job {job_id} completed successfully")
 
     except Exception as e:
-        validation_jobs[job_id]['status'] = 'error'
-        validation_jobs[job_id]['error'] = str(e)
+        update_job(job_id, status='error', error=str(e))
+        print(f"[WORKER] Job {job_id} error: {str(e)}")
 
 @app.route('/validate', methods=['POST'])
 def validate():
@@ -305,17 +317,20 @@ def validate():
     # Generate job ID
     job_id = str(uuid.uuid4())
 
-    # Initialize job
-    validation_jobs[job_id] = {
-        'status': 'initializing',
-        'progress': 0,
-        'processed': 0,
-        'total': 0,
-        'results': [],
-        'retrying': None,  # Track which VAT is being retried
-        'output_file': None,
-        'error': None
-    }
+    # Initialize job with thread safety
+    with validation_jobs_lock:
+        validation_jobs[job_id] = {
+            'status': 'initializing',
+            'progress': 0,
+            'processed': 0,
+            'total': 0,
+            'results': [],
+            'retrying': None,  # Track which VAT is being retried
+            'output_file': None,
+            'error': None,
+            'created_at': time.time()
+        }
+        print(f"[VALIDATE] Created job {job_id}, total jobs: {len(validation_jobs)}")
 
     # Start background thread
     thread = threading.Thread(
@@ -325,8 +340,8 @@ def validate():
     thread.daemon = True
     thread.start()
 
-    # Small delay to ensure thread has started
-    time.sleep(0.1)
+    # Longer delay to ensure thread has started
+    time.sleep(0.2)
 
     return jsonify({
         'success': True,
@@ -337,21 +352,40 @@ def validate():
 def validate_progress(job_id):
     """Server-Sent Events endpoint for validation progress"""
     def generate():
+        print(f"[PROGRESS] Client connected for job {job_id}")
+
         # Wait a bit for job to be created if not found immediately
-        max_wait = 5
+        max_wait = 10  # Increased from 5 to 10 seconds
         waited = 0
-        while job_id not in validation_jobs and waited < max_wait:
+        job_found = False
+
+        while waited < max_wait:
+            with validation_jobs_lock:
+                if job_id in validation_jobs:
+                    job_found = True
+                    print(f"[PROGRESS] Job {job_id} found after {waited}s")
+                    break
+                else:
+                    print(f"[PROGRESS] Job {job_id} not found, waiting... (total jobs: {len(validation_jobs)})")
+
             time.sleep(0.2)
             waited += 0.2
 
-        if job_id not in validation_jobs:
+        if not job_found:
+            print(f"[PROGRESS] Job {job_id} NOT FOUND after {max_wait}s")
             yield f"data: {json.dumps({'status': 'error', 'error': 'Job not found. Please try again.'})}\n\n"
             return
 
         last_sent_count = 0
 
         while True:
-            job = validation_jobs[job_id]
+            with validation_jobs_lock:
+                if job_id not in validation_jobs:
+                    print(f"[PROGRESS] Job {job_id} disappeared!")
+                    yield f"data: {json.dumps({'status': 'error', 'error': 'Job was removed'})}\n\n"
+                    return
+
+                job = validation_jobs[job_id].copy()  # Copy to avoid holding lock
 
             # Send progress update with all results
             update = {
@@ -370,6 +404,7 @@ def validate_progress(job_id):
 
             # Stop if completed or errored
             if job['status'] in ['completed', 'error']:
+                print(f"[PROGRESS] Job {job_id} finished with status: {job['status']}")
                 break
 
             time.sleep(0.5)  # Update every 500ms
@@ -391,4 +426,10 @@ def download(filename):
     return send_file(filepath, as_attachment=True)
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=8080)
+    print("=" * 60)
+    print("Starting VAT Validator Server")
+    print("=" * 60)
+    print(f"Server: http://0.0.0.0:8080")
+    print("Note: Debug mode is ON - auto-reload enabled")
+    print("=" * 60)
+    app.run(debug=True, host='0.0.0.0', port=8080, threaded=True, use_reloader=True)
