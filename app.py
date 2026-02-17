@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, send_file, Response, stream_with_context
+from flask import Flask, render_template, request, jsonify, send_file
 import openpyxl
 from openpyxl.styles import PatternFill
 import requests
@@ -19,6 +19,26 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 # In-memory storage for validation jobs with thread safety
 validation_jobs = {}
 validation_jobs_lock = threading.Lock()
+
+def cleanup_old_jobs():
+    """Remove completed/errored jobs older than 1 hour to prevent memory leak"""
+    cutoff_time = time.time() - 3600  # 1 hour ago
+
+    with validation_jobs_lock:
+        jobs_to_remove = [
+            job_id for job_id, job in validation_jobs.items()
+            if job['created_at'] < cutoff_time and job['status'] in ['completed', 'error']
+        ]
+
+        for job_id in jobs_to_remove:
+            print(f"[CLEANUP] Removing old job {job_id}")
+            del validation_jobs[job_id]
+
+        if jobs_to_remove:
+            print(f"[CLEANUP] Removed {len(jobs_to_remove)} old jobs, {len(validation_jobs)} remaining")
+
+    # Schedule next cleanup in 10 minutes
+    threading.Timer(600, cleanup_old_jobs).start()
 
 def update_job(job_id, **kwargs):
     """Thread-safe helper to update job status"""
@@ -68,9 +88,13 @@ def validate_vat(vat_input, retry_count=0, job_id=None, current_idx=0):
     if not vat_number:
         return {'valid': False, 'error': 'Tuščias PVM numeris / Empty VAT number', 'country': country_code}
 
+    # Log the validation attempt
+    if retry_count == 0:
+        print(f"[VAT] Validating {country_code}{vat_number}")
+
     try:
         url = f'https://ec.europa.eu/taxation_customs/vies/rest-api/ms/{country_code}/vat/{vat_number}'
-        response = requests.get(url, timeout=30)
+        response = requests.get(url, timeout=45)  # Increased from 30 to 45 seconds
 
         # Check if response is valid JSON
         if not response.text or response.text.strip() == '':
@@ -121,12 +145,20 @@ def validate_vat(vat_input, retry_count=0, job_id=None, current_idx=0):
         return {'valid': False, 'error': 'API timeout (server not responding)', 'country': country_code}
     except requests.exceptions.ConnectionError as e:
         # Retry on connection reset/refused errors (catches ConnectionResetError wrapped by requests)
-        if retry_count < 3:
+        error_detail = str(e)
+        print(f"[ERROR] Connection error for {country_code}{vat_number}: {error_detail}")
+
+        if retry_count < 5:  # Increased from 3 to 5 retries
             if job_id and current_idx > 0:
                 update_job(job_id, retrying=current_idx)
-            time.sleep(2 * (retry_count + 1))  # Longer delay for connection issues
+            # Exponential backoff: 3s, 6s, 9s, 12s, 15s
+            delay = 3 * (retry_count + 1)
+            print(f"[RETRY] Retrying after {delay}s (attempt {retry_count + 1}/5)")
+            time.sleep(delay)
             return validate_vat(vat_input, retry_count + 1, job_id, current_idx)
-        return {'valid': False, 'error': 'Connection error (VIES API connection lost)', 'country': country_code}
+
+        print(f"[FAILED] Gave up after 5 retries for {country_code}{vat_number}")
+        return {'valid': False, 'error': 'Connection error (VIES API connection lost after 5 retries)', 'country': country_code}
     except Exception as e:
         # Log unexpected errors with full details
         error_msg = f'Unexpected error: {type(e).__name__}: {str(e)}'
@@ -348,75 +380,29 @@ def validate():
         'job_id': job_id
     })
 
-@app.route('/validate-progress/<job_id>')
-def validate_progress(job_id):
-    """Server-Sent Events endpoint for validation progress"""
-    def generate():
-        print(f"[PROGRESS] Client connected for job {job_id}")
+@app.route('/job-status/<job_id>')
+def job_status(job_id):
+    """REST endpoint to check job status (polling-based)"""
+    with validation_jobs_lock:
+        if job_id not in validation_jobs:
+            print(f"[STATUS] Job {job_id} not found (total jobs: {len(validation_jobs)})")
+            return jsonify({'error': 'Job not found'}), 404
 
-        # Wait a bit for job to be created if not found immediately
-        max_wait = 10  # Increased from 5 to 10 seconds
-        waited = 0
-        job_found = False
+        job = validation_jobs[job_id].copy()
 
-        while waited < max_wait:
-            with validation_jobs_lock:
-                if job_id in validation_jobs:
-                    job_found = True
-                    print(f"[PROGRESS] Job {job_id} found after {waited}s")
-                    break
-                else:
-                    print(f"[PROGRESS] Job {job_id} not found, waiting... (total jobs: {len(validation_jobs)})")
+    # Return job status
+    response = {
+        'status': job['status'],
+        'progress': job['progress'],
+        'processed': job['processed'],
+        'total': job['total'],
+        'results': job['results'],
+        'retrying': job.get('retrying'),
+        'output_file': job.get('output_file'),
+        'error': job.get('error')
+    }
 
-            time.sleep(0.2)
-            waited += 0.2
-
-        if not job_found:
-            print(f"[PROGRESS] Job {job_id} NOT FOUND after {max_wait}s")
-            yield f"data: {json.dumps({'status': 'error', 'error': 'Job not found. Please try again.'})}\n\n"
-            return
-
-        last_sent_count = 0
-
-        while True:
-            with validation_jobs_lock:
-                if job_id not in validation_jobs:
-                    print(f"[PROGRESS] Job {job_id} disappeared!")
-                    yield f"data: {json.dumps({'status': 'error', 'error': 'Job was removed'})}\n\n"
-                    return
-
-                job = validation_jobs[job_id].copy()  # Copy to avoid holding lock
-
-            # Send progress update with all results
-            update = {
-                'status': job['status'],
-                'progress': job['progress'],
-                'processed': job['processed'],
-                'total': job['total'],
-                'results': job['results'],
-                'retrying': job.get('retrying'),  # Send retry status
-                'output_file': job.get('output_file'),
-                'error': job.get('error')
-            }
-            yield f"data: {json.dumps(update)}\n\n"
-
-            last_sent_count = len(job['results'])
-
-            # Stop if completed or errored
-            if job['status'] in ['completed', 'error']:
-                print(f"[PROGRESS] Job {job_id} finished with status: {job['status']}")
-                break
-
-            time.sleep(0.5)  # Update every 500ms
-
-    return Response(
-        stream_with_context(generate()),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no'
-        }
-    )
+    return jsonify(response)
 
 @app.route('/download/<filename>')
 def download(filename):
@@ -432,4 +418,9 @@ if __name__ == '__main__':
     print(f"Server: http://0.0.0.0:8080")
     print("Note: Debug mode is ON - auto-reload enabled")
     print("=" * 60)
+
+    # Start background job cleanup
+    cleanup_old_jobs()
+    print("Background job cleanup started (runs every 10 minutes)")
+
     app.run(debug=True, host='0.0.0.0', port=8080, threaded=True, use_reloader=True)

@@ -464,106 +464,135 @@
                     return;
                 }
 
-                // Connect to progress stream
+                // Start polling for job status
                 const jobId = data.job_id;
-                const eventSource = new EventSource(`/validate-progress/${jobId}`);
-
-                eventSource.onmessage = (event) => {
-                    const job = JSON.parse(event.data);
-
-                    if (job.error) {
-                        alert('Klaida: ' + job.error);
-                        eventSource.close();
-                        document.getElementById('step2').classList.remove('hidden');
-                        document.getElementById('step3').classList.add('hidden');
-                        return;
-                    }
-
-                    // Update progress bar
-                    const progress = job.progress || 0;
-                    const processed = job.processed || 0;
-                    const total = job.total || 0;
-                    const remaining = total - processed;
-                    const retrying = job.retrying;  // Which VAT is being retried
-
-                    document.getElementById('progressFill').style.width = progress + '%';
-                    document.getElementById('progressFill').textContent = progress + '%';
-
-                    // Show detailed progress with remaining count and retry status
-                    if (job.status === 'initializing') {
-                        document.getElementById('progressText').textContent = 'Pasiruošiama tikrinimui...';
-                        document.getElementById('timeEstimate').style.display = 'none';
-                    } else if (total > 0) {
-                        let progressMsg = `Tikrinama: ${processed} iš ${total} PVM numerių (liko: ${remaining})`;
-                        if (retrying) {
-                            progressMsg += ' 🔄 Kartojama užklausa...';
-                        }
-                        document.getElementById('progressText').textContent = progressMsg;
-
-                        // Calculate and display estimated time remaining
-                        if (remaining > 0 && processed > 0) {
-                            // Average 1.5 seconds per VAT (1s delay + 0.5s processing)
-                            const estimatedSeconds = Math.ceil(remaining * 1.5);
-                            const minutes = Math.floor(estimatedSeconds / 60);
-                            const seconds = estimatedSeconds % 60;
-                            const timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
-
-                            document.getElementById('timeRemaining').textContent = timeStr;
-                            document.getElementById('timeEstimate').style.display = 'block';
-                        } else {
-                            document.getElementById('timeEstimate').style.display = 'none';
-                        }
-                    } else {
-                        document.getElementById('progressText').textContent = 'Pradedamas tikrinimas...';
-                        document.getElementById('timeEstimate').style.display = 'none';
-                    }
-
-                    // Show partial results as we go (show step 4 early)
-                    if (job.results && job.results.length > 0 && validationResults.length === 0) {
-                        document.getElementById('step4').classList.remove('hidden');
-                    }
-
-                    // Update results in real-time
-                    if (job.results && job.results.length > validationResults.length) {
-                        validationResults = job.results;
-                        displayResults(false);  // false = don't hide progress bar
-                    }
-
-                    // If completed, finalize
-                    if (job.status === 'completed') {
-                        validationResults = job.results;
-                        outputFilename = job.output_file;
-
-                        document.getElementById('progressFill').style.width = '100%';
-                        document.getElementById('progressFill').textContent = '100%';
-                        document.getElementById('progressText').textContent =
-                            `Tikrinimas baigtas! Patikrinta ${total} PVM numerių.`;
-                        document.getElementById('timeEstimate').style.display = 'none';
-
-                        // Enable download button
-                        document.getElementById('downloadBtn').disabled = false;
-
-                        eventSource.close();
-
-                        displayResults(true);  // true = hide progress bar now that we're done
-                    }
-                };
-
-                eventSource.onerror = (error) => {
-                    console.error('EventSource error:', error);
-                    document.getElementById('progressText').textContent = 'Klaida gaunant progresą. Bandoma iš naujo...';
-
-                    // EventSource automatically reconnects, but close after 30 seconds
-                    setTimeout(() => {
-                        eventSource.close();
-                        alert('Nepavyko gauti progreso atnaujinimų. Prašome perkrauti puslapį ir bandyti dar kartą.');
-                    }, 30000);
-                };
+                startPolling(jobId);
 
             } catch (error) {
                 alert('Klaida tikrinant: ' + error.message);
             }
         });
+
+        function startPolling(jobId) {
+            let pollAttempts = 0;
+            const maxPollAttempts = 300; // 5 minutes max (300 seconds at 1 poll/sec)
+
+            const pollInterval = setInterval(async () => {
+                pollAttempts++;
+
+                try {
+                    const response = await fetch(`/job-status/${jobId}`);
+
+                    if (!response.ok) {
+                        if (response.status === 404) {
+                            console.error('Job not found');
+                            clearInterval(pollInterval);
+                            document.getElementById('progressText').innerHTML =
+                                '<div class="error">Darbas nerastas. Prašome perkrauti puslapį ir bandyti dar kartą.</div>';
+                            return;
+                        }
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+
+                    const job = await response.json();
+
+                    if (job.error) {
+                        clearInterval(pollInterval);
+                        alert('Klaida: ' + job.error);
+                        document.getElementById('step2').classList.remove('hidden');
+                        document.getElementById('step3').classList.add('hidden');
+                        return;
+                    }
+
+                    // Update progress
+                    updateProgress(job);
+
+                    // Stop polling if completed or errored
+                    if (job.status === 'completed' || job.status === 'error') {
+                        clearInterval(pollInterval);
+                    }
+
+                } catch (error) {
+                    console.error('Polling error:', error);
+
+                    // Stop after too many attempts
+                    if (pollAttempts >= maxPollAttempts) {
+                        clearInterval(pollInterval);
+                        document.getElementById('progressText').innerHTML =
+                            '<div class="error">Nepavyko gauti progreso atnaujinimų. Darbas gali tęstis fone. Perkraukite puslapį po minutės.</div>';
+                    }
+                }
+            }, 1000); // Poll every second
+        }
+
+        function updateProgress(job) {
+            const progress = job.progress || 0;
+            const processed = job.processed || 0;
+            const total = job.total || 0;
+            const remaining = total - processed;
+            const retrying = job.retrying;
+
+            // Update progress bar
+            document.getElementById('progressFill').style.width = progress + '%';
+            document.getElementById('progressFill').textContent = progress + '%';
+
+            // Show detailed progress with remaining count and retry status
+            if (job.status === 'initializing') {
+                document.getElementById('progressText').textContent = 'Pasiruošiama tikrinimui...';
+                document.getElementById('timeEstimate').style.display = 'none';
+            } else if (total > 0) {
+                let progressMsg = `Tikrinama: ${processed} iš ${total} PVM numerių (liko: ${remaining})`;
+                if (retrying) {
+                    progressMsg += ' 🔄 Kartojama užklausa...';
+                }
+                document.getElementById('progressText').textContent = progressMsg;
+
+                // Calculate and display estimated time remaining
+                if (remaining > 0 && processed > 0) {
+                    // Average 1.5 seconds per VAT (1s delay + 0.5s processing)
+                    const estimatedSeconds = Math.ceil(remaining * 1.5);
+                    const minutes = Math.floor(estimatedSeconds / 60);
+                    const seconds = estimatedSeconds % 60;
+                    const timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+
+                    document.getElementById('timeRemaining').textContent = timeStr;
+                    document.getElementById('timeEstimate').style.display = 'block';
+                } else {
+                    document.getElementById('timeEstimate').style.display = 'none';
+                }
+            } else {
+                document.getElementById('progressText').textContent = 'Pradedamas tikrinimas...';
+                document.getElementById('timeEstimate').style.display = 'none';
+            }
+
+            // Show partial results as we go (show step 4 early)
+            if (job.results && job.results.length > 0 && validationResults.length === 0) {
+                document.getElementById('step4').classList.remove('hidden');
+            }
+
+            // Update results in real-time
+            if (job.results && job.results.length > validationResults.length) {
+                validationResults = job.results;
+                displayResults(false);  // false = don't hide progress bar
+            }
+
+            // If completed, finalize
+            if (job.status === 'completed') {
+                validationResults = job.results;
+                outputFilename = job.output_file;
+
+                document.getElementById('progressFill').style.width = '100%';
+                document.getElementById('progressFill').textContent = '100%';
+                document.getElementById('progressText').textContent =
+                    `Tikrinimas baigtas! Patikrinta ${total} PVM numerių.`;
+                document.getElementById('timeEstimate').style.display = 'none';
+
+                // Enable download button
+                document.getElementById('downloadBtn').disabled = false;
+
+                displayResults(true);  // true = hide progress bar now that we're done
+            }
+        }
 
         function displayResults(hideProgress = false) {
             const container = document.getElementById('resultsContainer');
